@@ -36,8 +36,12 @@ configure(
     cors_origins=lambda stage: [f"https://app.{stage}.example.com"],
     feature_flag_evaluator=flags.evaluate_for,     # dict -> dict; optional
     on_invocation_start=[reset_per_invocation_state],
+    role_groups={**DEFAULT_ROLE_GROUPS, "is_platform_admin": "AcmeAdmin"},  # your pool's group names
+    role_aliases={"is_admin": "is_platform_admin"},  # optional: an older name kept working
 )
 ```
+
+`OrganizationUserContext` derives `is_platform_admin`, `is_organization_admin`, `is_organization_member`, `is_organization_seller` and `is_organization_customer` from the caller's groups. The platform-admin group defaults to `PlatformAdmin`, so an unconfigured service grants it to nobody. A role alias reads and writes its field, is accepted on construction, and is emitted beside it in the service context, the feature-flag evaluation context and the serialised model.
 
 `on_invocation_start` hooks receive the raw event at the start of every invocation, whatever the trigger. Use them for state that must not survive into the next invocation on a warm container.
 

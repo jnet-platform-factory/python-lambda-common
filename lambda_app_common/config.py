@@ -20,10 +20,12 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 
-## The groups that grant each derived role on `OrganizationUserContext`. These are the
-## names the platform's user pools use today; a service with other names passes its own.
+## The groups that grant each derived role on `OrganizationUserContext`. A service whose user
+## pool names them differently passes its own `role_groups`, e.g.
+## `{**DEFAULT_ROLE_GROUPS, "is_platform_admin": "AcmeAdmin"}`. An unconfigured platform-admin
+## group simply never matches, so a missed setting fails closed.
 DEFAULT_ROLE_GROUPS: Mapping[str, str] = {
-    "is_jnet_admin": "JunctionNetAdmin",
+    "is_platform_admin": "PlatformAdmin",
     "is_organization_admin": "OrganizationAdmin",
     "is_organization_member": "Member",
     "is_organization_seller": "Seller",
@@ -48,6 +50,11 @@ class PlatformConfig:
     ## otherwise carry over (an EventBridge loop-detection trail, say) is reset here.
     on_invocation_start: Sequence[Callable[[Any], None]] = field(default_factory=tuple)
     role_groups: Mapping[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_GROUPS))
+    ## Older names for the role fields, `{"old_name": "canonical_name"}`, for a service whose code,
+    ## feature-flag rules or API consumers still use them. An alias reads and sets the canonical
+    ## field on `OrganizationUserContext`, and is emitted beside it in `as_service_context()`,
+    ## the feature-flag evaluation context and the model's serialised form.
+    role_aliases: Mapping[str, str] = field(default_factory=dict)
 
     def resolved_stage(self) -> Optional[str]:
         return self.stage or os.environ.get("STAGE")
