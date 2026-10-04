@@ -26,7 +26,19 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[test]" sqlalchemy
       - name: Test
-        run: python -m pytest -v
+        run: python -m pytest -v --junitxml="$RUNNER_TEMP/pytest-report.xml"
+
+      - name: Summary
+        if: always()
+        continue-on-error: true
+        uses: jnet-platform-factory/.github/actions/job-summary@v0.0.1
+        with:
+          title: pytest — Python ${{ matrix.python-version }}
+          status: ${{ job.status }}
+          rows: |
+            Branch: ${{ github.head_ref || github.ref_name }}
+            Commit: ${{ github.sha }}
+          junit: ${{ runner.temp }}/pytest-report.xml
 
   vendored-import:
     # Services that ship only their own source tree vendor this repo at
@@ -42,7 +54,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install aws-lambda-powertools pydantic PyJWT
-      - run: |
+      - name: Import every module
+        id: imports
+        run: |
           touch src/__init__.py
           python - <<'EOF'
           import importlib, pkgutil
@@ -51,3 +65,15 @@ jobs:
               importlib.import_module(mod.name)
               print("ok", mod.name)
           EOF
+
+      - name: Summary
+        if: always()
+        continue-on-error: true
+        uses: jnet-platform-factory/.github/actions/job-summary@v0.0.1
+        with:
+          title: Imports cleanly when vendored
+          status: ${{ job.status }}
+          rows: |
+            Layout: src/platform_common
+            Imports: ${{ steps.imports.outcome == 'success' && '✅ every module imported' || steps.imports.outcome == 'failure' && '❌ an import failed' || steps.imports.outcome == 'skipped' && '⏭️ skipped' || '🚫 cancelled' }}
+            Commit: ${{ github.sha }}
