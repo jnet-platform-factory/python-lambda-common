@@ -1,0 +1,217 @@
+name: Create Release
+
+# Bumps the version, tags main as vX.Y.Z, creates the GitHub release and the
+# release/vX.Y.Z branch, the same way as every other platform repository: Run
+# workflow, pick patch, minor or major.
+#
+# The version lives in two places, pyproject.toml (`version`, what PyPI
+# publishes) and lambda_app_common/__init__.py (`__version__`, what vendored
+# copies report), and a tag must name the version the package carries. So this
+# workflow does not just tag: it computes the next version from the current one,
+# writes it to both files in one "Release vX.Y.Z" commit on main, and tags that
+# commit. Nobody bumps the version by hand.
+#
+# Then it hands the tag to publish.yml, which publishes it to PyPI. A tag created
+# with GITHUB_TOKEN does not fire `push` workflows, so it is dispatched
+# explicitly, on the tag, which is the only ref publish.yml accepts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "How to bump the version?"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      current: ${{ steps.v.outputs.current }}
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - name: Refuse anything but main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Releases are cut from main only; this run is on $REF."
+          exit 1
+      - uses: actions/checkout@v4
+      - name: Read the version, bump it, check the tag is free
+        id: v
+        env:
+          BUMP: ${{ inputs.bump_type }}
+        run: |
+          # Exactly one `version = "X.Y.Z"` key in pyproject.toml and one
+          # `__version__ = "X.Y.Z"` in the package, and they must agree.
+          MATCHES=$(grep -cE '^version[[:space:]]*=' pyproject.toml || true)
+          if [ "$MATCHES" != "1" ]; then
+            echo "::error::Expected exactly one version key in pyproject.toml, found $MATCHES."
+            exit 1
+          fi
+          CURRENT=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' pyproject.toml)
+          PACKAGE=$(sed -nE 's/^__version__[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' lambda_app_common/__init__.py)
+          if [ "$CURRENT" != "$PACKAGE" ]; then
+            echo "::error::pyproject.toml says $CURRENT but lambda_app_common/__init__.py says '$PACKAGE'."
+            exit 1
+          fi
+          if ! [[ "$CURRENT" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Version '$CURRENT' is not X.Y.Z."
+            exit 1
+          fi
+          MAJOR=${BASH_REMATCH[1]} MINOR=${BASH_REMATCH[2]} PATCH=${BASH_REMATCH[3]}
+          case "$BUMP" in
+            major) VERSION="$((MAJOR + 1)).0.0" ;;
+            minor) VERSION="$MAJOR.$((MINOR + 1)).0" ;;
+            patch) VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+            *) echo "::error::Unknown bump '$BUMP'."; exit 1 ;;
+          esac
+          TAG="v$VERSION"
+          # A version is released once, and a PyPI release is immutable, so an
+          # existing tag is never reused or moved.
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::$TAG already exists. Pick a bigger bump."
+            exit 1
+          fi
+          echo "Releasing $TAG ($BUMP bump from $CURRENT)"
+          {
+            echo "current=$CURRENT"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  # The same gates as every pull request, on the commit being released. The
+  # release commit only changes the two version strings.
+  check:
+    name: Gates
+    needs: [version]
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    name: Bump, tag and release
+    needs: [version, check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      url: ${{ steps.r.outputs.url }}
+      commit: ${{ steps.bump.outputs.commit }}
+      branch: ${{ steps.b.outputs.branch }}
+      publish: ${{ steps.p.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Write the new version and commit it to main
+        id: bump
+        env:
+          CURRENT: ${{ needs.version.outputs.current }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
+          BUMP: ${{ inputs.bump_type }}
+        run: |
+          OLD="${CURRENT//./\\.}"
+          sed -i -E "s/^(version[[:space:]]*=[[:space:]]*\")${OLD}(\")/\1${VERSION}\2/" pyproject.toml
+          sed -i -E "s/^(__version__[[:space:]]*=[[:space:]]*\")${OLD}(\")/\1${VERSION}\2/" lambda_app_common/__init__.py
+          grep -qE "^version[[:space:]]*=[[:space:]]*\"${VERSION//./\\.}\"" pyproject.toml \
+            || { echo "::error::pyproject.toml does not carry $VERSION after the bump."; exit 1; }
+          grep -qE "^__version__[[:space:]]*=[[:space:]]*\"${VERSION//./\\.}\"" lambda_app_common/__init__.py \
+            || { echo "::error::lambda_app_common/__init__.py does not carry $VERSION after the bump."; exit 1; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release $TAG" -m "$BUMP bump from $CURRENT: version in pyproject.toml and lambda_app_common/__init__.py."
+          # Fails if main moved since this run started; re-run to release from
+          # the new head.
+          if ! git push origin HEAD:main; then
+            echo "::error::main moved since this run started. Run Create Release again."
+            exit 1
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and release
+        id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ steps.bump.outputs.commit }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          NOTES="\`lambda_app_common\` **${VERSION}**, commit \`${SHA}\`.
+
+          Install with \`pip install lambda_app_common==${VERSION}\` once it is on PyPI. To vendor it, \`git subtree add --prefix=src/platform_common ${SERVER}/${REPO}.git ${TAG} --squash\` — or pin the full SHA when a build must be reproducible (a tag can move, a SHA cannot)."
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --target "$SHA" \
+            --title "$TAG" \
+            --notes "$NOTES" \
+            --generate-notes \
+            --latest
+          echo "url=${SERVER}/${REPO}/releases/tag/${TAG}" >> "$GITHUB_OUTPUT"
+
+      # The release/<tag> branch every platform repository cuts, so a fix to a
+      # released version has somewhere to land without taking main with it.
+      - name: Create the release branch
+        id: b
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ steps.bump.outputs.commit }}
+        run: |
+          BRANCH="release/$TAG"
+          if git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null; then
+            echo "::error::$BRANCH already exists."
+            exit 1
+          fi
+          git push origin "$SHA:refs/heads/$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch the PyPI publish
+        id: p
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh workflow run publish.yml --repo "$REPO" --ref "$TAG"
+          echo "result=dispatched" >> "$GITHUB_OUTPUT"
+
+  # A job of its own: the action is pinned to a movable tag, so it runs where
+  # no write token exists.
+  summary:
+    name: Summary
+    needs: [version, check, release]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Summary
+        if: always()
+        continue-on-error: true
+        uses: jnet-platform-factory/.github/actions/job-summary@v0.0.1
+        with:
+          title: Create release — ${{ needs.version.outputs.tag || 'version not resolved' }}
+          needs: ${{ toJSON(needs) }}
+          rows: |
+            Release: ${{ needs.release.outputs.url && format('[{0}]({1})', needs.version.outputs.tag, needs.release.outputs.url) || '' }}
+            Bump: ${{ inputs.bump_type }}${{ needs.version.outputs.current && format(' · {0} → {1}', needs.version.outputs.current, needs.version.outputs.version) || '' }}
+            Release branch: ${{ needs.release.outputs.branch && format('[{0}]({1}/{2}/tree/{0})', needs.release.outputs.branch, github.server_url, github.repository) || '' }}
+            PyPI publish: ${{ needs.release.outputs.publish && format('[{0}]({1}/{2}/actions/workflows/publish.yml)', needs.release.outputs.publish, github.server_url, github.repository) || 'not dispatched' }}
+            Release commit: ${{ needs.release.outputs.commit }}

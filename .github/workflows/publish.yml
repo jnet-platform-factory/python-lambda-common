@@ -1,0 +1,191 @@
+name: Publish to PyPI
+
+# Publishes a release tag to PyPI and attaches the signed distributions to its
+# GitHub release. Runs on:
+#
+#   - Create Release, which dispatches this on the tag it just made. A tag
+#     created with GITHUB_TOKEN does not fire `push` workflows (GitHub's guard
+#     against loops), so the dispatch is how a release reaches this file.
+#   - a v* tag pushed by hand;
+#   - Run workflow, choosing the tag (not a branch) under "Use workflow from".
+#
+# PyPI access is trusted publishing (OIDC): no token is stored anywhere. PyPI
+# trusts exactly this repository, this file (publish.yml) and the `pypi`
+# environment, so renaming the file or the environment needs the trusted
+# publisher on pypi.org updated in the same change.
+#
+# A PyPI release is immutable. If the version is already on PyPI the upload is
+# skipped, so re-running after a later step failed is the normal path.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Refuse anything but a release tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Publish runs on a vX.Y.Z tag; this run is on $REF. Under 'Use workflow from', pick the tag."
+          exit 1
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The tag must equal the package version
+        id: v
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' pyproject.toml)
+          PACKAGE=$(sed -nE 's/^__version__[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' lambda_app_common/__init__.py)
+          if [ "v$VERSION" != "$TAG" ] || [ "$PACKAGE" != "$VERSION" ]; then
+            echo "::error::Tag $TAG, pyproject.toml '$VERSION' and __version__ '$PACKAGE' must all agree. PyPI would publish $VERSION under a tag that says otherwise."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # The same gates as every pull request, on the tagged commit.
+  check:
+    name: Gates
+    needs: [resolve]
+    uses: ./.github/workflows/tests.yml
+
+  build:
+    name: Build and check
+    needs: [resolve, check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the sdist and wheel
+        run: |
+          python -m pip install build
+          python -m build
+      # The check no other gate makes: that what is uploaded installs on its
+      # own and imports with only its declared dependencies.
+      - name: Install the wheel in a clean venv and import every module
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/clean/bin/python - <<'EOF'
+          import importlib, os, pkgutil
+          import lambda_app_common as pkg
+          assert pkg.__version__ == os.environ["VERSION"], (pkg.__version__, os.environ["VERSION"])
+          for mod in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
+              importlib.import_module(mod.name)
+              print("ok", mod.name)
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/lambda_app_common/${{ needs.resolve.outputs.version }}/
+    permissions:
+      id-token: write # trusted publishing
+    outputs:
+      result: ${{ steps.check.outputs.result || 'published' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Skip if PyPI already has this version
+        id: check
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/lambda_app_common/${VERSION}/json")
+          if [ "$STATUS" = "200" ]; then
+            echo "PyPI already has $VERSION; nothing to upload"
+            echo "result=already published" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload
+        if: steps.check.outputs.result == ''
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  sign:
+    name: Sign and attach to the release
+    needs: [resolve, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload release assets
+      id-token: write # sigstore
+    outputs:
+      release: ${{ steps.attach.outputs.release }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Sign the distributions with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with:
+          inputs: >-
+            ./dist/*.tar.gz
+            ./dist/*.whl
+      # Create Release makes the release before dispatching this; a tag pushed
+      # by hand has none yet, so make it here.
+      - name: Attach to the GitHub release
+        id: attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes --verify-tag
+          fi
+          gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+          echo "release=${SERVER}/${REPO}/releases/tag/${TAG}" >> "$GITHUB_OUTPUT"
+
+  # A job of its own: the action is pinned to a movable tag, so it runs where
+  # no token is issued.
+  summary:
+    name: Summary
+    needs: [resolve, check, build, publish, sign]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Summary
+        if: always()
+        continue-on-error: true
+        uses: jnet-platform-factory/.github/actions/job-summary@v0.0.1
+        with:
+          title: Publish to PyPI — ${{ github.ref_name }}
+          needs: ${{ toJSON(needs) }}
+          rows: |
+            Version: ${{ needs.resolve.outputs.version }}
+            PyPI: ${{ needs.publish.outputs.result && format('[{0}](https://pypi.org/project/lambda_app_common/{1}/)', needs.publish.outputs.result, needs.resolve.outputs.version) || needs.publish.result }}
+            Release: ${{ needs.sign.outputs.release && format('[{0}]({1})', github.ref_name, needs.sign.outputs.release) || needs.sign.result }}
+            Commit: ${{ github.sha }}
