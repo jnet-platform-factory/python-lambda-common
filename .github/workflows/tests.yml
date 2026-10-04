@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Create Release and Publish run these same gates on the commit they ship.
+  workflow_call: {}
 
 permissions:
   contents: read

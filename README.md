@@ -113,4 +113,13 @@ pip install -e ".[test]" sqlalchemy
 pytest
 ```
 
-Releases publish to PyPI from a `v*` tag.
+## Releasing
+
+Actions → **Create Release** → Run workflow on `main`, pick `patch`, `minor` or `major`. It:
+
+1. reads the version from `pyproject.toml` (which must match `lambda_app_common.__version__`), bumps it, and refuses a tag that already exists;
+2. runs the same tests as every pull request;
+3. commits `Release vX.Y.Z` to `main` with both version strings bumped, then tags it, creates the GitHub release and the `release/vX.Y.Z` branch;
+4. dispatches **Publish to PyPI** on the tag. It checks the tag matches the package version, runs the tests again, builds, installs the wheel in a clean venv and imports every module, uploads to PyPI with trusted publishing (environment `pypi`), and attaches Sigstore-signed artifacts to the release. A version PyPI already has is skipped, so re-running is safe.
+
+Nobody edits the version by hand. The version in the files is always the last release.
