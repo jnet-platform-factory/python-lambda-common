@@ -1,113 +1,112 @@
 # lambda_app_common
 
+Middleware for AWS Lambda services built on [Powertools for AWS Lambda (Python)](https://docs.powertools.aws.dev/lambda/python/):
+
+- an **API Gateway handler chain** for `APIGatewayRestResolver` — request logging with credentials redacted, error handling that publishes failures as events, identity resolution, dependency injection, response logging;
+- an **event middleware** for EventBridge, SQS and SES entry points;
+- **bounded telemetry**: logger keys that cannot grow with the event, an `api_request` metric whose metadata cannot break the EMF flush.
+
+It replaces the "handler object" pattern, where every Lambda built one god-object at import time that dispatched on event shape and did all of the above in one place.
+
+## Install
+
 ```
 pip install lambda_app_common
 ```
 
-## Usage API Proxy Handler Controller
-
-```python
-import traceback
-from http import HTTPStatus
-
-from aws_lambda_powertools.event_handler import APIGatewayRestResolver, CORSConfig, Response
-from aws_lambda_powertools.event_handler.exceptions import (InternalServerError)
-from aws_lambda_powertools.utilities.typing import LambdaContext
-
-from lambda_app_common import Organization, env_vars
-req_handler = Organization.ApiRequestHandler('Application', 'Service')
-
-cors_config = CORSConfig(allow_origin=env_vars.CORS_ALLOW_ORIGIN, max_age=300)
-app = APIGatewayRestResolver(cors=cors_config)
-
-examples = Examples()
-
-@app.get("/examples")
-def get_examples():
-    try:
-        response = examples.find_all()
-    except Exception as e:
-        examples.logger.exception(e)
-        print(traceback.format_exc())
-        raise InternalServerError(f"get_organization {str(e)}") from e
-
-    return Response(status_code=HTTPStatus.OK.value, content_type="application/json",
-                    body=req_handler.body_data(response))
-
-
-
-# @tracer.capture_lambda_handler()
-@examples.logger.inject_lambda_context(log_event=env_vars.LOG_EVENT)
-@examples.metrics.log_metrics(capture_cold_start_metric=True)
-def proxy_handler(event, context: LambdaContext):
-    req_handler.event = event
-
-    req_handler.init_metrics(examples.metrics)
-    # req_handler.init_tracer(admin_organization.tracer)
-    req_handler.init_logger(examples.logger)
-
-    examples.context = req_handler.get_user_context()
-
-    response = app.resolve(event, context)
-    return response
+Services that ship only their own source tree (dependencies come from Lambda layers) vendor the repository instead:
 
 ```
+git subtree add --prefix=src/platform_common https://github.com/jnet-platform-factory/python-lambda-common.git main --squash
+```
 
+and import it as `src.platform_common.lambda_app_common`. Every import inside the package is relative so both layouts work; CI checks the vendored one.
 
+## Configure once
+
+Call `configure` from one wiring module, before any handler module builds its app:
 
 ```python
-from lambda_app_common.Service import DbOrganizationService, OrganizationService
+from lambda_app_common.config import configure
 
-class DbOrganizationService(OrganizationService):
-    def __init__(self,
-                 service_name: str,
-                 database: Database,
-                 repository: ModelRepository,
-                 event_bus: OrganizationEventBus,
-                 logger: Logger,
-                 tracer=None,
-                 metrics=None
-                 ):
-        super().__init__(service_name, event_bus, logger, tracer, metrics)
-        self.database = database
-        self.repository = repository
-
-
-class OrganizationService(PlatformService):
-
-    def __init__(self,
-                 service_name: str,
-                 event_bus: OrganizationEventBus,
-                 logger: Logger,
-                 tracer=None,
-                 metrics=None
-                 ):
-        super().__init__(service_name, event_bus, logger, tracer, metrics)
-        self._context = None
-        self._organization = None
-        self._username = None
-        self._user_groups = None
-        self.user_applications = None
-        self.user_branches = None
-        self.user_zoneinfo = None
-        self.user_locale = None
-        self.user_env = None
-
-
-
-class PlatformService(ABC):
-    def __init__(self,
-                 service_name: str,
-                 event_bus: OrganizationEventBus,
-                 logger: Logger,
-                 tracer=None,
-                 metrics=None
-                 ):
-        self.service_name: str = service_name
-        self.current_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        self.current_date = datetime.now().strftime('%Y-%m-%d')
-        self._event_bus = event_bus
-        self._logger = logger
-        self._tracer = tracer
-        self._metrics = metrics
+configure(
+    stage="dev",                                   # default: $STAGE
+    application="Orders",                          # default: $APPLICATION
+    jwt_secret=secret,                             # default: $JWT_SECRET (HS256 service tokens)
+    cors_origins=lambda stage: [f"https://app.{stage}.example.com"],
+    feature_flag_evaluator=flags.evaluate_for,     # dict -> dict; optional
+    on_invocation_start=[reset_per_invocation_state],
+)
 ```
+
+`on_invocation_start` hooks receive the raw event at the start of every invocation, whatever the trigger. Use them for state that must not survive into the next invocation on a warm container.
+
+## HTTP
+
+```python
+from aws_lambda_powertools.event_handler import APIGatewayRestResolver
+from lambda_app_common.factory import build_service
+from lambda_app_common.http import (
+    api_error_handler_for, body_data, get_cors_config, inject_organization_user_context,
+    inject_services, print_request_info, response_data,
+)
+
+orders = build_service("Orders", FACTORIES_MAP).build()   # at import: a bad entry fails the cold start
+
+app = APIGatewayRestResolver(cors=get_cors_config())
+app.use(middlewares=[
+    print_request_info,                     # outermost
+    api_error_handler_for("orders.api"),
+    inject_organization_user_context,
+    inject_services({"orders_service": orders}, logger=orders.logger, metrics=orders.metrics),
+    response_data,                          # innermost
+])
+
+
+@app.get("/orders")
+def list_orders():
+    service = app.context["services"]["orders_service"]    # service.context is the caller
+    return body_data(service.find_all())
+
+
+def proxy_handler(event, context):
+    return app.resolve(event, context)
+```
+
+| Middleware                                  | Does                                                                                                                                                                                                                        |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `print_request_info`                        | One summary line per request; the redacted, truncated request under `DEBUG=1`.                                                                                                                                              |
+| `api_error_handler_for(source)`             | `ServiceError`s keep their status; `ValueError`/`TypeError`/`KeyError`/`AttributeError`/`IntegrityError` → 400; anything else → 500. Each failure is published on the first `event_bus` found in `app.context['services']`. |
+| `inject_organization_user_context`          | Cognito authorizer claims, else `Authorization: Bearer` (RS256 read, HS256 verified), `ApiKey`, `X-Webhook-Token`, `x-api-key`; none → 401. Sets `app.context['organization_user_context']`.                                |
+| `legacy_user_context(bearer_identity=...)`  | The old handler's identity rules, for endpoints whose callers depend on them. See its docstring for the four differences.                                                                                                   |
+| `inject_services({...}, logger=, metrics=)` | Sets `service.context` (the caller as a dict), adds the services to `app.context['services']`, appends logger keys, records `api_request`.                                                                                  |
+| `response_data`                             | Logs the response status and size; the body under `DEBUG=1`.                                                                                                                                                                |
+
+## Events
+
+```python
+from aws_lambda_powertools.utilities.data_classes import EventBridgeEvent, event_source
+from lambda_app_common.events import current_invocation, event_context
+
+
+@logger.inject_lambda_context(log_event=True)
+@event_context(service="Invoices", logger=service.logger, metrics=service.metrics)
+@event_source(data_class=EventBridgeEvent)
+def handler(event, context):
+    invocation = current_invocation()       # kind, source, detail_type, organization, username, ...
+```
+
+Put it inside the logger decorator and outside any `event_source` or batch decorator, so it sees the raw event. It runs the start hooks, classifies the event, prints one summary line, appends logger keys (an EventBridge `detail` larger than `DETAIL_LOG_MAX_CHARS` is replaced by its shape), and records `api_request` when given `metrics`.
+
+## Upgrading from 1.x
+
+2.0 removes the 1.x modules (`Database`, `Environment`, `Events`, `Factory`, `Models`, `Repository`, `RequestContext`, `Service`, `TaskProcessor`, `imports`) and their handler objects. Use the middleware above.
+
+## Development
+
+```
+pip install -e ".[test]" sqlalchemy
+pytest
+```
+
+Releases publish to PyPI from a `v*` tag.
