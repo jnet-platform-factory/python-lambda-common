@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from .config import get_config
 
@@ -38,7 +38,7 @@ class OrganizationUserContext(BaseModel):
     # Optional or derived attributes
     user_customer: Optional[str] = None
     user_seller: Optional[str] = None
-    is_jnet_admin: Optional[bool] = None
+    is_platform_admin: Optional[bool] = None
     is_organization_admin: Optional[bool] = None
     is_organization_member: Optional[bool] = None
     is_organization_seller: Optional[bool] = None
@@ -48,6 +48,40 @@ class OrganizationUserContext(BaseModel):
 
     # Feature flags evaluated for this user's session/role/org
     feature_flags: Optional[FeatureFlagsMap] = Field(default=None, description="Feature flags relevant to this user")
+
+    # --- role aliases (config.role_aliases) -------------------------------------------------
+    # A service whose code, flag rules or API consumers still use an older role name configures
+    # e.g. `role_aliases={"is_admin": "is_platform_admin"}`; the alias then behaves as the field.
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_aliases(cls, data):
+        aliases = get_config().role_aliases
+        if isinstance(data, dict) and aliases:
+            data = dict(data)
+            for alias, canonical in aliases.items():
+                if alias in data:
+                    value = data.pop(alias)
+                    data.setdefault(canonical, value)
+        return data
+
+    def __getattr__(self, name):
+        canonical = get_config().role_aliases.get(name)
+        if canonical is not None:
+            return getattr(self, canonical)
+        return super().__getattr__(name)
+
+    def __setattr__(self, name, value):
+        super().__setattr__(get_config().role_aliases.get(name, name), value)
+
+    @model_serializer(mode="wrap")
+    def _serialise_with_aliases(self, handler):
+        data = handler(self)
+        if isinstance(data, dict):
+            for alias, canonical in get_config().role_aliases.items():
+                if canonical in data:
+                    data[alias] = data[canonical]
+        return data
 
     @property
     def feature_flags_dict(self) -> dict:
@@ -82,13 +116,13 @@ class OrganizationUserContext(BaseModel):
         """The user as the plain dict services have always been handed as `service.context`.
 
         Services written against the old handler read these exact keys
-        (`service.context['is_jnet_admin']`, `['organization']`, ...), so the shape is a
+        (`service.context['is_platform_admin']`, `['organization']`, ...), so the shape is a
         contract: keys are always present, with None where nothing is known, and the role
-        booleans are never None.
+        booleans are never None. Configured role aliases are included beside their field.
         """
         groups = list(self.user_groups or [])
         role_groups = get_config().role_groups
-        return {
+        context = {
             "organization": self.organization,
             "username": self.username,
             "user_email": self.user_email,
@@ -101,3 +135,7 @@ class OrganizationUserContext(BaseModel):
             "seller_id": self.seller_id,
             "customer_id": self.customer_id,
         }
+        for alias, canonical in get_config().role_aliases.items():
+            if canonical in context:
+                context[alias] = context[canonical]
+        return context

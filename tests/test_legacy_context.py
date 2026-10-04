@@ -27,10 +27,10 @@ def test_a_webhook_token_reads_user_groups_and_defaults_to_member():
 
 
 def test_a_webhook_token_with_groups_keeps_them():
-    token = hs256({"organization": "ACME", "username": "hook", "user_groups": ["JunctionNetAdmin"],
+    token = hs256({"organization": "ACME", "username": "hook", "user_groups": ["PlatformAdmin"],
                    "user_applications": ["udm"]})
     user, _ = resolve_legacy_user_context(proxy_event(headers={"x-webhook-token": token}))
-    assert user.is_jnet_admin is True
+    assert user.is_platform_admin is True
     assert user.user_applications == ["udm"]
 
 

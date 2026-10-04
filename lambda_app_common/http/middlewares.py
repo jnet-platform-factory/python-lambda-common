@@ -352,13 +352,18 @@ def attach_feature_flags(user_context: OrganizationUserContext) -> None:
     if evaluator is None:
         return
     try:
-        flags = evaluator({
+        context = {
             'organization': user_context.organization,
             'username': user_context.username,
-            'is_jnet_admin': user_context.is_jnet_admin or False,
+            'is_platform_admin': user_context.is_platform_admin or False,
             'application': user_context.application,
             'user_applications': user_context.user_applications or [],
-        })
+        }
+        ## Flag rules written against an older role name keep matching.
+        for alias, canonical in get_config().role_aliases.items():
+            if canonical in context:
+                context[alias] = context[canonical]
+        flags = evaluator(context)
         if flags is not None:
             user_context.with_feature_flags(flags)
     except Exception as _ff_err:  # noqa: BLE001 - flags must not fail the request

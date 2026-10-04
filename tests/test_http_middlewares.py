@@ -76,12 +76,12 @@ def test_cognito_claims_become_the_user_and_the_service_context():
     assert ctx["user_email"] == "jane@example.com"
     assert ctx["user_groups"] == ["Member", "OrganizationAdmin"]
     assert ctx["is_organization_admin"] is True
-    assert ctx["is_jnet_admin"] is False
+    assert ctx["is_platform_admin"] is False
     assert ctx["user_env"] == "dev"
     assert ctx["user_customer"] == "C-9" and ctx["customer_id"] == "C-9"
     # the legacy dict shape: every key present
     assert set(ctx) == {"organization", "username", "user_email", "user_groups", "user_env",
-                        "user_applications", "user_customer", "user_seller", "is_jnet_admin",
+                        "user_applications", "user_customer", "user_seller", "is_platform_admin",
                         "is_organization_admin", "is_organization_member", "is_organization_seller",
                         "is_organization_customer", "seller_id", "customer_id"}
 
