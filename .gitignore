@@ -1,4 +1,9 @@
-
 /.idea
 /.history
-/lambda_app_common/__pycache__
+__pycache__/
+*.pyc
+/dist
+/build
+*.egg-info
+.pytest_cache/
+.venv/
