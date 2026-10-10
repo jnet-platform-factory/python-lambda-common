@@ -8,6 +8,7 @@ service's own wiring module before any handler module is imported:
         stage=env_vars.STAGE,
         application=env_vars.APPLICATION,
         jwt_secret=env_vars.JWT_SECRET,
+        cognito_user_pool_id=env_vars.USER_POOL_ID,
         cors_origins=origins_for_stage,
         feature_flag_evaluator=flags.evaluate_all_for_user,
         on_invocation_start=[EventBridge.set_incoming_trail],
@@ -40,6 +41,9 @@ class PlatformConfig:
     stage: Optional[str] = None
     application: Optional[str] = None
     jwt_secret: Optional[str] = None
+    ## The Cognito user pool ("<region>_<id>") whose RS256 tokens the chain accepts when no
+    ## API Gateway authorizer validated them. Unset, such tokens are refused.
+    cognito_user_pool_id: Optional[str] = None
     ## A list of allowed origins, or a callable taking the stage and returning one. The
     ## first origin becomes CORSConfig.allow_origin and the rest extra_origins.
     cors_origins: OriginsSource = None
@@ -64,6 +68,9 @@ class PlatformConfig:
 
     def resolved_jwt_secret(self) -> Optional[str]:
         return self.jwt_secret or os.environ.get("JWT_SECRET")
+
+    def resolved_cognito_user_pool_id(self) -> Optional[str]:
+        return self.cognito_user_pool_id or os.environ.get("COGNITO_USER_POOL_ID")
 
 
 _config = PlatformConfig()

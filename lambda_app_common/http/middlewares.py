@@ -21,7 +21,9 @@ resolution (a bad token becomes a 401, not a crash) and everything inside it.
 import base64
 import inspect
 import json
+import time
 import traceback
+import urllib.request
 from typing import Any, Callable, Dict, Mapping, Optional
 
 import jwt
@@ -287,41 +289,130 @@ def _extract_token_from_authorization_header(headers: dict) -> Optional[str]:
     return None
 
 
-def _decode_jwt_token(token: str) -> tuple:
-    """Decode a JWT and return (payload, algorithm).
+## Cognito token types accepted on a Bearer header: an ID token carries the user's custom
+## attributes; an access token is what a client-credentials (machine) client gets.
+COGNITO_TOKEN_USES = ("id", "access")
 
-    - RS256: a Cognito token. The signature is not re-verified here because the Cognito
-      authorizer in API Gateway is the authoritative validator.
+## How long an unknown `kid` must wait before it may trigger another JWKS fetch, so tokens
+## naming made-up key ids cannot turn every request into an outbound call.
+JWKS_REFETCH_MIN_SECONDS = 300
+
+## issuer -> {"keys": {kid: PyJWK}, "fetched_at": monotonic seconds}. Module scope: a warm
+## container fetches its user pool's JWKS once and keeps it.
+_jwks_cache: dict = {}
+
+
+def _cognito_issuer() -> str:
+    pool_id = get_config().resolved_cognito_user_pool_id()
+    if not pool_id:
+        logger.error("RS256 token received but no cognito_user_pool_id is configured")
+        raise UnauthorizedError("Unable to verify token")
+    region = pool_id.split("_", 1)[0]  # pool ids are "<region>_<id>"
+    return f"https://cognito-idp.{region}.amazonaws.com/{pool_id}"
+
+
+def _fetch_jwks(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 - fixed https URL
+        return json.load(response)
+
+
+def _cognito_signing_key(issuer: str, kid: Optional[str]):
+    """The user pool's public key for `kid`. The JWKS is fetched once per container, plus at
+    most one refetch per JWKS_REFETCH_MIN_SECONDS when an unknown key id shows up."""
+    entry = _jwks_cache.get(issuer)
+    stale = entry is None or (
+        kid not in entry["keys"] and time.monotonic() - entry["fetched_at"] >= JWKS_REFETCH_MIN_SECONDS
+    )
+    if stale:
+        try:
+            jwks = jwt.PyJWKSet.from_dict(_fetch_jwks(f"{issuer}/.well-known/jwks.json"))
+        except jwt.exceptions.PyJWKSetError as e:
+            ## No loadable key, which is also what a missing `cryptography` looks like.
+            logger.error("Cognito JWKS has no usable keys; is 'cryptography' installed?", error=str(e))
+            raise UnauthorizedError("Unable to verify token")
+        except Exception as e:  # noqa: BLE001 - network or JSON failure
+            logger.error("Fetching the Cognito JWKS failed", issuer=issuer, error=str(e))
+            raise ServiceError(503, "Unable to verify token")
+        entry = {"keys": {key.key_id: key for key in jwks.keys}, "fetched_at": time.monotonic()}
+        _jwks_cache[issuer] = entry
+
+    key = entry["keys"].get(kid)
+    if key is None:
+        raise UnauthorizedError("Invalid token.")
+    return key
+
+
+def _decode_cognito_token(token: str, header: Mapping) -> dict:
+    issuer = _cognito_issuer()
+    key = _cognito_signing_key(issuer, header.get("kid"))
+    payload = jwt.decode(
+        token,
+        key.key,  # the RSA public key itself; PyJWT < 2.9 does not accept a PyJWK here
+        algorithms=["RS256"],
+        issuer=issuer,
+        ## A pool has several app clients, and ID and access tokens name theirs differently
+        ## (`aud` vs `client_id`), so the audience is not pinned; iss + token_use are.
+        options={"verify_aud": False, "require": ["exp", "iss", "token_use"]},
+    )
+    if payload.get("token_use") not in COGNITO_TOKEN_USES:
+        raise UnauthorizedError("Invalid token.")
+    return payload
+
+
+def _decode_jwt_token(token: str) -> tuple:
+    """Verify a JWT and return (payload, algorithm).
+
+    - RS256: a Cognito token, verified against the configured user pool's JWKS, with `iss`
+      and `token_use` checked. Claims are trusted unverified only when API Gateway's
+      authorizer supplied them, which never reaches this function.
     - HS256: an internal service token, verified against the configured JWT secret.
+
+    The header only picks which verifier runs; each is pinned to its own algorithm and key.
+    A missing, "none" or other alg is a 401, as is a bad signature or an expired token.
     """
     try:
         header = jwt.get_unverified_header(token)
-    except jwt.exceptions.DecodeError:
+    except jwt.InvalidTokenError:
         raise UnauthorizedError("Authorization token is malformed")
 
-    alg = header.get("alg", "HS256")
-    if alg == "RS256":
-        return jwt.decode(token, options={"verify_signature": False}), alg
-    if alg == "HS256":
-        try:
+    alg = header.get("alg")
+    try:
+        if alg == "RS256":
+            return _decode_cognito_token(token, header), alg
+        if alg == "HS256":
             return jwt.decode(token, get_config().resolved_jwt_secret(), algorithms=["HS256"]), alg
-        except jwt.ExpiredSignatureError:
-            raise UnauthorizedError("Token has expired.")
-        except jwt.InvalidTokenError:
-            raise UnauthorizedError("Invalid token.")
-    raise UnauthorizedError(f"Unsupported token algorithm: {alg}")
+    except jwt.ExpiredSignatureError:
+        raise UnauthorizedError("Token has expired.")
+    except jwt.InvalidTokenError:
+        raise UnauthorizedError("Invalid token.")
+    raise UnauthorizedError("Unsupported token algorithm")
+
+
+def _first_present(claims: Mapping, *names: str):
+    return next((claims[name] for name in names if claims.get(name) is not None), None)
+
+
+def groups_and_applications(claims: Mapping) -> tuple:
+    """(user_groups, user_applications) from any of the claim shapes tokens use:
+    `groups` / `applications`, Cognito's `cognito:groups` / `custom:applications`, or
+    `user_groups` / `user_applications`. The first one present wins."""
+    groups = _first_present(claims, "groups", "cognito:groups", "user_groups")
+    applications = _first_present(claims, "applications", "custom:applications", "user_applications")
+    return normalize_to_list(groups), normalize_to_list(applications)
 
 
 def _context_from_cognito_claims(claims: Mapping) -> OrganizationUserContext:
     config = get_config()
+    groups, applications = groups_and_applications(claims)
     return OrganizationUserContext(
         organization=claims.get("custom:organization"),
         user_id=claims.get("sub"),
-        username=claims.get("cognito:username"),
+        ## An access token has no cognito:username, only username.
+        username=claims.get("cognito:username") or claims.get("username"),
         user_email=claims.get("email", ""),
-        user_groups=normalize_to_list(claims.get("cognito:groups")),
+        user_groups=groups,
         branches=normalize_to_list(claims.get("custom:branches")),
-        user_applications=normalize_to_list(claims.get("custom:applications")),
+        user_applications=applications,
         user_customer=claims.get("custom:customer"),
         user_seller=claims.get("custom:seller"),
         customer_id=claims.get("custom:customer"),
@@ -333,14 +424,15 @@ def _context_from_cognito_claims(claims: Mapping) -> OrganizationUserContext:
 
 def _context_from_service_token(decoded: Mapping) -> OrganizationUserContext:
     config = get_config()
+    groups, applications = groups_and_applications(decoded)
     return OrganizationUserContext(
         organization=decoded.get("organization"),
         username=decoded.get("username"),
         user_id=f"{decoded.get('organization')}-{decoded.get('username')}",
         user_email=decoded.get("email", ""),
-        user_groups=normalize_to_list(decoded.get("cognito:groups")),
+        user_groups=groups,
         branches=normalize_to_list(decoded.get("branches")),
-        user_applications=normalize_to_list(decoded.get("applications")),
+        user_applications=applications,
         environment=config.resolved_stage(),
         application=config.resolved_application(),
     ).derive_roles()
@@ -384,8 +476,10 @@ def inject_organization_user_context(app: APIGatewayRestResolver, next_middlewar
     Resolve who is calling and put it on `app.context['organization_user_context']`.
 
     Priority:
-      1. Cognito claims -- a user authenticated by the API's Cognito authorizer
-      2. Authorization: Bearer <jwt> (RS256) -- a Cognito JWT with no authorizer attached
+      1. Cognito claims -- a user authenticated by the API's Cognito authorizer; trusted
+         as-is, since API Gateway has already validated the token
+      2. Authorization: Bearer <jwt> (RS256) -- a Cognito JWT with no authorizer attached,
+         verified against the configured user pool's JWKS
       3. Authorization: Bearer <jwt> (HS256) -- an internal service-to-service JWT
       4. Authorization: ApiKey <key>
       5. X-Webhook-Token -- deprecated; migrate to Authorization: Bearer

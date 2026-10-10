@@ -20,7 +20,7 @@ classifiers = [
 dependencies = [
     "aws-lambda-powertools>=2.21",
     "pydantic>=2",
-    "PyJWT>=2",
+    "PyJWT[crypto]>=2",  # crypto: RS256 verification needs `cryptography`
 ]
 
 [project.optional-dependencies]
