@@ -116,11 +116,13 @@ def test_a_forged_service_token_is_a_401():
     assert response["statusCode"] == 401
 
 
-def test_an_unverified_rs256_token_is_read_like_cognito_claims():
+def test_an_unsigned_rs256_token_is_a_401():
     service = Service()
     token = rs256_shaped(COGNITO_CLAIMS)
-    build_app(service).resolve(proxy_event(headers={"authorization": f"Bearer {token}"}), lambda_context())
-    assert service.context["username"] == "jane"
+    response = build_app(service).resolve(proxy_event(headers={"authorization": f"Bearer {token}"}),
+                                          lambda_context())
+    assert response["statusCode"] == 401
+    assert service.context is None
 
 
 def test_no_credentials_is_a_401_and_the_route_never_runs():

@@ -33,6 +33,7 @@ configure(
     stage="dev",                                   # default: $STAGE
     application="Orders",                          # default: $APPLICATION
     jwt_secret=secret,                             # default: $JWT_SECRET (HS256 service tokens)
+    cognito_user_pool_id="us-east-1_AbC123",      # default: $COGNITO_USER_POOL_ID (RS256 Bearer tokens)
     cors_origins=lambda stage: [f"https://app.{stage}.example.com"],
     feature_flag_evaluator=flags.evaluate_for,     # dict -> dict; optional
     on_invocation_start=[reset_per_invocation_state],
@@ -81,7 +82,7 @@ def proxy_handler(event, context):
 | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `print_request_info`                        | One summary line per request; the redacted, truncated request under `DEBUG=1`.                                                                                                                                              |
 | `api_error_handler_for(source)`             | `ServiceError`s keep their status; `ValueError`/`TypeError`/`KeyError`/`AttributeError`/`IntegrityError` → 400; anything else → 500. Each failure is published on the first `event_bus` found in `app.context['services']`. |
-| `inject_organization_user_context`          | Cognito authorizer claims, else `Authorization: Bearer` (RS256 read, HS256 verified), `ApiKey`, `X-Webhook-Token`, `x-api-key`; none → 401. Sets `app.context['organization_user_context']`.                                |
+| `inject_organization_user_context`          | Cognito authorizer claims, else `Authorization: Bearer` (RS256 verified against the pool's JWKS, HS256 against the secret), `ApiKey`, `X-Webhook-Token`, `x-api-key`; none, invalid or expired → 401. Sets `app.context['organization_user_context']`.                                |
 | `legacy_user_context(bearer_identity=...)`  | The old handler's identity rules, for endpoints whose callers depend on them. See its docstring for the four differences.                                                                                                   |
 | `inject_services({...}, logger=, metrics=)` | Sets `service.context` (the caller as a dict), adds the services to `app.context['services']`, appends logger keys, records `api_request`.                                                                                  |
 | `response_data`                             | Logs the response status and size; the body under `DEBUG=1`.                                                                                                                                                                |

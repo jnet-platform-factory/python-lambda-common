@@ -39,7 +39,7 @@ def hs256(payload, secret=SECRET, expires_in=600):
 
 
 def rs256_shaped(payload):
-    """A token with an RS256 header. Its signature is never checked by the middleware."""
+    """A token with an RS256 header and a signature no key produced."""
     header = {"alg": "RS256", "typ": "JWT"}
     import base64
 
